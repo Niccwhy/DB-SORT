@@ -32,21 +32,30 @@ if __name__ == '__main__':
             image_cnt += 1
             file_path = DATA_PATH + 'CrowdHuman_{}/'.format(split) + '{}.jpg'.format(ann_data['ID'])
             im = Image.open(file_path)
-            image_info = {'file_name': '{}.jpg'.format(ann_data['ID']), 
+            # [DB-SORT-VIS] 补充 MOT 语义字段: frame_id/video_id, 供 MOTDataset 读取
+            image_info = {'file_name': '{}.jpg'.format(ann_data['ID']),
                           'id': image_cnt,
-                          'height': im.size[1], 
-                          'width': im.size[0]}
+                          'height': im.size[1],
+                          'width': im.size[0],
+                          'frame_id': image_cnt,
+                          'video_id': 0}
             out['images'].append(image_info)
             if split != 'test':
                 anns = ann_data['gtboxes']
                 for i in range(len(anns)):
                     ann_cnt += 1
                     fbox = anns[i]['fbox']
+                    # [DB-SORT-VIS] 保留 vbox 的两种字段名 (bbox_vis 兼容 ByteTrack,
+                    # visible_bbox 供 DB-SORT 双头读取), 并约束 vbox 合法范围
+                    vbox = anns[i].get('vbox', fbox)
+                    if vbox[2] < 0 or vbox[3] < 0:
+                        vbox = fbox
                     ann = {'id': ann_cnt,
                          'category_id': 1,
                          'image_id': image_cnt,
                          'track_id': -1,
-                         'bbox_vis': anns[i]['vbox'],
+                         'bbox_vis': vbox,
+                         'visible_bbox': vbox,
                          'bbox': fbox,
                          'area': fbox[2] * fbox[3],
                          'iscrowd': 1 if 'extra' in anns[i] and \

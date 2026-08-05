@@ -114,6 +114,12 @@ class MosaicDetection(Dataset):
                     labels[:, 1] = scale * _labels[:, 1] + padh
                     labels[:, 2] = scale * _labels[:, 2] + padw
                     labels[:, 3] = scale * _labels[:, 3] + padh
+                    # [DB-SORT-VIS] 可见框 [6:10] 同步 scale+pad 变换
+                    if _labels.shape[1] >= 10:
+                        labels[:, 6] = scale * _labels[:, 6] + padw
+                        labels[:, 7] = scale * _labels[:, 7] + padh
+                        labels[:, 8] = scale * _labels[:, 8] + padw
+                        labels[:, 9] = scale * _labels[:, 9] + padh
                 mosaic_labels.append(labels)
 
             if len(mosaic_labels):
@@ -205,14 +211,26 @@ class MosaicDetection(Dataset):
             y_offset: y_offset + target_h, x_offset: x_offset + target_w
         ]
 
+        # [DB-SORT-VIS] label 列 >= 10 时含可见框 [6:10], 与全身框同步变换
+        has_vis = cp_labels.shape[1] >= 10
         cp_bboxes_origin_np = adjust_box_anns(
             cp_labels[:, :4].copy(), cp_scale_ratio, 0, 0, origin_w, origin_h
         )
+        if has_vis:
+            cp_vis_origin_np = adjust_box_anns(
+                cp_labels[:, 6:10].copy(), cp_scale_ratio, 0, 0, origin_w, origin_h
+            )
         if FLIP:
             cp_bboxes_origin_np[:, 0::2] = (
                 origin_w - cp_bboxes_origin_np[:, 0::2][:, ::-1]
             )
+            if has_vis:
+                cp_vis_origin_np[:, 0::2] = (
+                    origin_w - cp_vis_origin_np[:, 0::2][:, ::-1]
+                )
         cp_bboxes_transformed_np = cp_bboxes_origin_np.copy()
+        if has_vis:
+            cp_vis_transformed_np = cp_vis_origin_np.copy()
         '''
         cp_bboxes_transformed_np[:, 0::2] = np.clip(
             cp_bboxes_transformed_np[:, 0::2] - x_offset, 0, target_w
@@ -223,13 +241,21 @@ class MosaicDetection(Dataset):
         '''
         cp_bboxes_transformed_np[:, 0::2] = cp_bboxes_transformed_np[:, 0::2] - x_offset
         cp_bboxes_transformed_np[:, 1::2] = cp_bboxes_transformed_np[:, 1::2] - y_offset
+        if has_vis:
+            cp_vis_transformed_np[:, 0::2] = cp_vis_transformed_np[:, 0::2] - x_offset
+            cp_vis_transformed_np[:, 1::2] = cp_vis_transformed_np[:, 1::2] - y_offset
         keep_list = box_candidates(cp_bboxes_origin_np.T, cp_bboxes_transformed_np.T, 5)
 
         if keep_list.sum() >= 1.0:
             cls_labels = cp_labels[keep_list, 4:5].copy()
             id_labels = cp_labels[keep_list, 5:6].copy()
             box_labels = cp_bboxes_transformed_np[keep_list]
-            labels = np.hstack((box_labels, cls_labels, id_labels))
+            if has_vis:
+                vis_labels = cp_vis_transformed_np[keep_list]
+                # 与 mot.py 列布局一致: [x1,y1,x2,y2, cls, id, x1v,y1v,x2v,y2v]
+                labels = np.hstack((box_labels, cls_labels, id_labels, vis_labels))
+            else:
+                labels = np.hstack((box_labels, cls_labels, id_labels))
             # remove outside bbox
             labels = labels[labels[:, 0] < target_w]
             labels = labels[labels[:, 2] > 0]

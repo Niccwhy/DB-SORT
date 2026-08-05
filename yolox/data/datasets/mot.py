@@ -21,6 +21,7 @@ class MOTDataset(Dataset):
         img_size=(608, 1088),
         preproc=None,
         run_tracking=False,         # [hgx0411] dataloader related
+        use_visible_head=False,     # [DB-SORT-VIS] 是否加载可见框标注
     ):
         """
         COCO dataset initialization. Annotation data are read into memory by COCO API.
@@ -47,6 +48,7 @@ class MOTDataset(Dataset):
         self.img_size = img_size
         self.preproc = preproc
         self.run_tracking = run_tracking  # [hgx0411] dataloader related
+        self.use_visible_head = use_visible_head  # [DB-SORT-VIS]
 
     def __len__(self):
         return len(self.ids)
@@ -74,13 +76,27 @@ class MOTDataset(Dataset):
 
         num_objs = len(objs)
 
-        res = np.zeros((num_objs, 6))
+        # [DB-SORT-VIS] 开启可见框时 label 扩展为 10 列:
+        #   [x1,y1,x2,y2, cls, track_id, x1v,y1v,x2v,y2v] (可见框 tlbr)
+        res = np.zeros((num_objs, 10 if self.use_visible_head else 6))
 
         for ix, obj in enumerate(objs):
             cls = self.class_ids.index(obj["category_id"])
             res[ix, 0:4] = obj["clean_bbox"]        # format: tlbr
             res[ix, 4] = cls                        # class id, 0 for person
             res[ix, 5] = obj["track_id"]            # track id
+            if self.use_visible_head:
+                # 兼容两种字段名: visible_bbox (自定义) / bbox_vis (ByteTrack 转换脚本)
+                vis = obj.get("visible_bbox", obj.get("bbox_vis", None))
+                if vis is None:
+                    # 无可见框标注时默认 = 全身框, 兼容旧数据
+                    vis = obj["bbox"]
+                vx1, vy1 = vis[0], vis[1]
+                vx2, vy2 = vx1 + vis[2], vy1 + vis[3]
+                if vx2 >= vx1 and vy2 >= vy1:
+                    res[ix, 6:10] = [vx1, vy1, vx2, vy2]
+                else:
+                    res[ix, 6:10] = obj["clean_bbox"]
 
         file_name = im_ann["file_name"] if "file_name" in im_ann else "{:012}".format(id_) + ".jpg"
         img_info = (height, width, frame_id, video_id, file_name)

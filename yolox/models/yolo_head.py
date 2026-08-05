@@ -25,6 +25,10 @@ class YOLOXHead(nn.Module):
         in_channels=[256, 512, 1024],
         act="silu",
         depthwise=False,
+        use_visible_head=False,       # [DB-SORT-VIS] 双回归头: 全身框 + 可见框
+        vis_loss_weight=0.7,          # [DB-SORT-VIS] 可见框回归损失权重
+        vis_assign_weight=0.3,        # [DB-SORT-VIS] SimOTA cost 中可见框 IoU 项权重
+        vis_warmup_steps=5000,        # [DB-SORT-VIS] 分配权重热身步数(缓解初期噪声)
     ):
         """
         Args:
@@ -36,6 +40,13 @@ class YOLOXHead(nn.Module):
         self.n_anchors = 1
         self.num_classes = num_classes
         self.decode_in_inference = True  # for deploy, set to False
+
+        # [DB-SORT-VIS]
+        self.use_visible_head = use_visible_head
+        self.vis_loss_weight = vis_loss_weight
+        self.vis_assign_weight = vis_assign_weight
+        self.vis_warmup_steps = vis_warmup_steps
+        self.train_steps = 0
 
         self.cls_convs = nn.ModuleList()
         self.reg_convs = nn.ModuleList()
@@ -123,6 +134,19 @@ class YOLOXHead(nn.Module):
                 )
             )
 
+        if self.use_visible_head:
+            self.vis_preds = nn.ModuleList()
+            for _ in range(len(in_channels)):
+                self.vis_preds.append(
+                    nn.Conv2d(
+                        in_channels=int(256 * width),
+                        out_channels=4,
+                        kernel_size=1,
+                        stride=1,
+                        padding=0,
+                    )
+            )
+
         self.use_l1 = False
         self.l1_loss = nn.L1Loss(reduction="none")
         self.bcewithlog_loss = nn.BCEWithLogitsLoss(reduction="none")
@@ -162,9 +186,14 @@ class YOLOXHead(nn.Module):
             reg_feat = reg_conv(reg_x)
             reg_output = self.reg_preds[k](reg_feat)
             obj_output = self.obj_preds[k](reg_feat)
+            if self.use_visible_head:
+                vis_output = self.vis_preds[k](reg_feat)
 
             if self.training:
-                output = torch.cat([reg_output, obj_output, cls_output], 1)
+                if self.use_visible_head:
+                    output = torch.cat([reg_output, vis_output, obj_output, cls_output], 1)
+                else:
+                    output = torch.cat([reg_output, obj_output, cls_output], 1)
                 output, grid = self.get_output_and_grid(
                     output, k, stride_this_level, xin[0].type()
                 )
@@ -187,9 +216,14 @@ class YOLOXHead(nn.Module):
                     origin_preds.append(reg_output.clone())
 
             else:
-                output = torch.cat(
-                    [reg_output, obj_output.sigmoid(), cls_output.sigmoid()], 1
-                )
+                if self.use_visible_head:
+                    output = torch.cat(
+                        [reg_output, vis_output, obj_output.sigmoid(), cls_output.sigmoid()], 1
+                    )
+                else:
+                    output = torch.cat(
+                        [reg_output, obj_output.sigmoid(), cls_output.sigmoid()], 1
+                    )
 
             outputs.append(output)
 
@@ -206,7 +240,7 @@ class YOLOXHead(nn.Module):
             )
         else:
             self.hw = [x.shape[-2:] for x in outputs]
-            # [batch, n_anchors_all, 85]
+            # [batch, n_anchors_all, 85] / [batch, n_anchors_all, 89]
             outputs = torch.cat(
                 [x.flatten(start_dim=2) for x in outputs], dim=2
             ).permute(0, 2, 1)
@@ -219,7 +253,7 @@ class YOLOXHead(nn.Module):
         grid = self.grids[k]
 
         batch_size = output.shape[0]
-        n_ch = 5 + self.num_classes
+        n_ch = 9 + self.num_classes if self.use_visible_head else 5 + self.num_classes
         hsize, wsize = output.shape[-2:]
         if grid.shape[2:4] != output.shape[2:4]:
             yv, xv = torch.meshgrid([torch.arange(hsize), torch.arange(wsize)])
@@ -233,6 +267,10 @@ class YOLOXHead(nn.Module):
         grid = grid.view(1, -1, 2)
         output[..., :2] = (output[..., :2] + grid) * stride
         output[..., 2:4] = torch.exp(output[..., 2:4]) * stride
+        if self.use_visible_head:
+            # [DB-SORT-VIS] 可见框坐标与全身框同方式解码
+            output[..., 4:6] = (output[..., 4:6] + grid) * stride
+            output[..., 6:8] = torch.exp(output[..., 6:8]) * stride
         return output, grid
 
     def decode_outputs(self, outputs, dtype):
@@ -250,6 +288,10 @@ class YOLOXHead(nn.Module):
 
         outputs[..., :2] = (outputs[..., :2] + grids) * strides
         outputs[..., 2:4] = torch.exp(outputs[..., 2:4]) * strides
+        if self.use_visible_head:
+            # [DB-SORT-VIS] 可见框坐标与全身框同方式解码
+            outputs[..., 4:6] = (outputs[..., 4:6] + grids) * strides
+            outputs[..., 6:8] = torch.exp(outputs[..., 6:8]) * strides
         return outputs
 
     def get_losses(
@@ -263,9 +305,16 @@ class YOLOXHead(nn.Module):
         origin_preds,
         dtype,
     ):
+        # [DB-SORT-VIS] 双头时输出布局: [full(4), vis(4), obj(1), cls]
+        self.train_steps += 1
         bbox_preds = outputs[:, :, :4]  # [batch, n_anchors_all, 4]
-        obj_preds = outputs[:, :, 4].unsqueeze(-1)  # [batch, n_anchors_all, 1]
-        cls_preds = outputs[:, :, 5:]  # [batch, n_anchors_all, n_cls]
+        if self.use_visible_head:
+            vis_preds = outputs[:, :, 4:8]  # [batch, n_anchors_all, 4]
+            obj_preds = outputs[:, :, 8].unsqueeze(-1)  # [batch, n_anchors_all, 1]
+            cls_preds = outputs[:, :, 9:]  # [batch, n_anchors_all, n_cls]
+        else:
+            obj_preds = outputs[:, :, 4].unsqueeze(-1)  # [batch, n_anchors_all, 1]
+            cls_preds = outputs[:, :, 5:]  # [batch, n_anchors_all, n_cls]
 
         # calculate targets
         mixup = labels.shape[2] > 5
@@ -287,6 +336,8 @@ class YOLOXHead(nn.Module):
         l1_targets = []
         obj_targets = []
         fg_masks = []
+        if self.use_visible_head:
+            vis_reg_targets = []
 
         num_fg = 0.0
         num_gts = 0.0
@@ -300,11 +351,16 @@ class YOLOXHead(nn.Module):
                 l1_target = outputs.new_zeros((0, 4))
                 obj_target = outputs.new_zeros((total_num_anchors, 1))
                 fg_mask = outputs.new_zeros(total_num_anchors).bool()
+                if self.use_visible_head:
+                    vis_reg_target = outputs.new_zeros((0, 4))
             else:
                 gt_bboxes_per_image = labels[batch_idx, :num_gt, 1:5]
                 gt_classes = labels[batch_idx, :num_gt, 0]
+                if self.use_visible_head:
+                    # [DB-SORT-VIS] 可见框 GT (cxcywh), 列布局见 TrainTransform
+                    gt_vis_boxes_per_image = labels[batch_idx, :num_gt, 6:10]
                 bboxes_preds_per_image = bbox_preds[batch_idx]
-                
+
                 try:
                     (
                         gt_matched_classes,
@@ -327,6 +383,8 @@ class YOLOXHead(nn.Module):
                         obj_preds,
                         labels,
                         imgs,
+                        gt_vis_boxes_per_image=gt_vis_boxes_per_image if self.use_visible_head else None,
+                        vis_preds=vis_preds if self.use_visible_head else None,
                     )
                 except RuntimeError:
                     logger.info(
@@ -359,10 +417,12 @@ class YOLOXHead(nn.Module):
                         obj_preds,
                         labels,
                         imgs,
-                        "cpu",
+                        gt_vis_boxes_per_image=gt_vis_boxes_per_image if self.use_visible_head else None,
+                        vis_preds=vis_preds if self.use_visible_head else None,
+                        mode="cpu",
                     )
-                
-                
+
+
                 torch.cuda.empty_cache()
                 num_fg += num_fg_img
 
@@ -371,6 +431,9 @@ class YOLOXHead(nn.Module):
                 ) * pred_ious_this_matching.unsqueeze(-1)
                 obj_target = fg_mask.unsqueeze(-1)
                 reg_target = gt_bboxes_per_image[matched_gt_inds]
+                if self.use_visible_head:
+                    # [DB-SORT-VIS] 可见框回归目标, 与全身框共用 fg_mask/分配结果
+                    vis_reg_target = gt_vis_boxes_per_image[matched_gt_inds]
 
                 if self.use_l1:
                     l1_target = self.get_l1_target(
@@ -387,6 +450,8 @@ class YOLOXHead(nn.Module):
             fg_masks.append(fg_mask)
             if self.use_l1:
                 l1_targets.append(l1_target)
+            if self.use_visible_head:
+                vis_reg_targets.append(vis_reg_target)
 
         cls_targets = torch.cat(cls_targets, 0)
         reg_targets = torch.cat(reg_targets, 0)
@@ -394,6 +459,8 @@ class YOLOXHead(nn.Module):
         fg_masks = torch.cat(fg_masks, 0)
         if self.use_l1:
             l1_targets = torch.cat(l1_targets, 0)
+        if self.use_visible_head:
+            vis_reg_targets = torch.cat(vis_reg_targets, 0)
 
         num_fg = max(num_fg, 1)
         loss_iou = (
@@ -414,8 +481,22 @@ class YOLOXHead(nn.Module):
         else:
             loss_l1 = 0.0
 
+        # [DB-SORT-VIS] 可见框回归损失(与全身框共用 IOUloss)
+        if self.use_visible_head:
+            loss_vis_iou = (
+                self.iou_loss(vis_preds.view(-1, 4)[fg_masks], vis_reg_targets)
+            ).sum() / num_fg
+        else:
+            loss_vis_iou = 0.0
+
         reg_weight = 5.0
-        loss = reg_weight * loss_iou + loss_obj + loss_cls + loss_l1
+        loss = (
+            reg_weight * loss_iou
+            + self.vis_loss_weight * loss_vis_iou
+            + loss_obj
+            + loss_cls
+            + loss_l1
+        )
 
         return (
             loss,
@@ -424,6 +505,7 @@ class YOLOXHead(nn.Module):
             loss_cls,
             loss_l1,
             num_fg / max(num_gts, 1),
+            loss_vis_iou,  # [DB-SORT-VIS] 可见框回归损失(未启用时为 0.0)
         )
 
     def get_l1_target(self, l1_target, gt, stride, x_shifts, y_shifts, eps=1e-8):
@@ -451,6 +533,8 @@ class YOLOXHead(nn.Module):
         labels,
         imgs,
         mode="gpu",
+        gt_vis_boxes_per_image=None,  # [DB-SORT-VIS] 可见框 GT (cxcywh)
+        vis_preds=None,               # [DB-SORT-VIS] 可见框预测 [batch, anchors, 4]
     ):
 
         if mode == "cpu":
@@ -461,6 +545,8 @@ class YOLOXHead(nn.Module):
             expanded_strides = expanded_strides.cpu().float()
             x_shifts = x_shifts.cpu()
             y_shifts = y_shifts.cpu()
+            if gt_vis_boxes_per_image is not None:
+                gt_vis_boxes_per_image = gt_vis_boxes_per_image.cpu().float()
 
         img_size = imgs.shape[2:]
         fg_mask, is_in_boxes_and_center = self.get_in_boxes_info(
@@ -478,9 +564,14 @@ class YOLOXHead(nn.Module):
         obj_preds_ = obj_preds[batch_idx][fg_mask]
         num_in_boxes_anchor = bboxes_preds_per_image.shape[0]
 
+        if vis_preds is not None:
+            vis_preds_per_image = vis_preds[batch_idx][fg_mask]
+
         if mode == "cpu":
             gt_bboxes_per_image = gt_bboxes_per_image.cpu()
             bboxes_preds_per_image = bboxes_preds_per_image.cpu()
+            if vis_preds is not None:
+                vis_preds_per_image = vis_preds_per_image.cpu().float()
 
         pair_wise_ious = bboxes_iou(gt_bboxes_per_image, bboxes_preds_per_image, False)
 
@@ -510,6 +601,21 @@ class YOLOXHead(nn.Module):
             + 3.0 * pair_wise_ious_loss
             + 100000.0 * (~is_in_boxes_and_center)
         )
+
+        if vis_preds is not None:
+            # [DB-SORT-VIS] 修改2: cost 加入可见框回归项。
+            # 使用有界损失 (1 - IoU) 避免小框场景下 -log 尺度失衡;
+            # 权重随训练步数线性热身, 缓解初期可见框预测噪声对分配的干扰。
+            pair_wise_vis_ious = bboxes_iou(
+                gt_vis_boxes_per_image, vis_preds_per_image, False
+            )
+            if self.vis_warmup_steps > 0:
+                warmup_ratio = min(1.0, self.train_steps / float(self.vis_warmup_steps))
+            else:
+                warmup_ratio = 1.0
+            pair_wise_vis_ious_loss = 1 - pair_wise_vis_ious
+            cost = cost + (self.vis_assign_weight * warmup_ratio) * pair_wise_vis_ious_loss
+            del pair_wise_vis_ious, pair_wise_vis_ious_loss
 
         (
             num_fg,

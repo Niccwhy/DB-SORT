@@ -114,36 +114,47 @@ def random_perspective(
     # Transform label coordinates
     n = len(targets)
     if n:
-        # warp points
-        xy = np.ones((n * 4, 3))
-        xy[:, :2] = targets[:, [0, 1, 2, 3, 0, 3, 2, 1]].reshape(
-            n * 4, 2
-        )  # x1y1, x2y2, x1y2, x2y1
+        # [DB-SORT-VIS] label 列 >= 10 时含可见框 [6:10], 需同步参与仿射变换
+        has_vis = targets.shape[1] >= 10
+        # warp points: 全身框 4 角 (x1y1, x2y2, x1y2, x2y1) + 可见框 4 角
+        if has_vis:
+            idx = [0, 1, 2, 3, 0, 3, 2, 1, 6, 7, 8, 9, 6, 9, 8, 7]
+        else:
+            idx = [0, 1, 2, 3, 0, 3, 2, 1]
+        xy = np.ones((n * len(idx) // 2, 3))
+        xy[:, :2] = targets[:, idx].reshape(xy.shape[0], 2)
         xy = xy @ M.T  # transform
         if perspective:
-            xy = (xy[:, :2] / xy[:, 2:3]).reshape(n, 8)  # rescale
+            xy = (xy[:, :2] / xy[:, 2:3]).reshape(n, len(idx))  # rescale
         else:  # affine
-            xy = xy[:, :2].reshape(n, 8)
+            xy = xy[:, :2].reshape(n, len(idx))
 
-        # create new boxes
+        # create new boxes (全身框)
         x = xy[:, [0, 2, 4, 6]]
         y = xy[:, [1, 3, 5, 7]]
-        xy = np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
+        full_xy = np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
+        if has_vis:
+            # create new boxes (可见框)
+            xv = xy[:, [8, 10, 12, 14]]
+            yv = xy[:, [9, 11, 13, 15]]
+            vis_xy = np.concatenate((xv.min(1), yv.min(1), xv.max(1), yv.max(1))).reshape(4, n).T
 
         # clip boxes
         #xy[:, [0, 2]] = xy[:, [0, 2]].clip(0, width)
         #xy[:, [1, 3]] = xy[:, [1, 3]].clip(0, height)
 
-        # filter candidates
-        i = box_candidates(box1=targets[:, :4].T * s, box2=xy.T)
+        # filter candidates (基于全身框, 保持原有行为)
+        i = box_candidates(box1=targets[:, :4].T * s, box2=full_xy.T)
         targets = targets[i]
-        targets[:, :4] = xy[i]
-        
+        targets[:, :4] = full_xy[i]
+        if has_vis:
+            targets[:, 6:10] = vis_xy[i]
+
         targets = targets[targets[:, 0] < width]
         targets = targets[targets[:, 2] > 0]
         targets = targets[targets[:, 1] < height]
         targets = targets[targets[:, 3] > 0]
-        
+
     return img, targets
 
 
@@ -177,13 +188,21 @@ def _distort(image):
     return image
 
 
-def _mirror(image, boxes):
+def _mirror(image, boxes, vis_boxes=None):
+    # [DB-SORT-VIS] 增加可选 vis_boxes 参数:
+    #   传入时与 boxes 共享同一次翻转决策(保证可见框与全身框镜像一致);
+    #   不传时行为与原始完全一致, 返回两个值。
     _, width, _ = image.shape
     if random.randrange(2):
         image = image[:, ::-1]
         boxes = boxes.copy()
         boxes[:, 0::2] = width - boxes[:, 2::-2]
-    return image, boxes
+        if vis_boxes is not None:
+            vis_boxes = vis_boxes.copy()
+            vis_boxes[:, 0::2] = width - vis_boxes[:, 2::-2]
+    if vis_boxes is None:
+        return image, boxes
+    return image, boxes, vis_boxes
 
 
 def preproc(image, input_size, mean, std, swap=(2, 0, 1)):
@@ -219,11 +238,14 @@ class TrainTransform:
         self.max_labels = max_labels
 
     def __call__(self, image, targets, input_dim):
+        # [DB-SORT-VIS] targets 列数 >= 10 时含可见框 [6:10](tlbr), 与全身框同步变换
+        has_vis = targets.shape[1] >= 10
         boxes = targets[:, :4].copy()
+        vis_boxes = targets[:, 6:10].copy() if has_vis else None
         labels = targets[:, 4].copy()
         ids = targets[:, 5].copy()
         if len(boxes) == 0:
-            targets = np.zeros((self.max_labels, 6), dtype=np.float32)
+            targets = np.zeros((self.max_labels, 10 if has_vis else 6), dtype=np.float32)
             image, r_o, _ = preproc(image, input_dim, self.means, self.std)     # [hgx 0424] _ for raw_image
             image = np.ascontiguousarray(image, dtype=np.float32)
             return image, targets
@@ -234,21 +256,31 @@ class TrainTransform:
         boxes_o = targets_o[:, :4]
         labels_o = targets_o[:, 4]
         ids_o = targets_o[:, 5]
+        vis_boxes_o = targets_o[:, 6:10] if has_vis else None
         # bbox_o: [xyxy] to [c_x,c_y,w,h]
         boxes_o = xyxy2cxcywh(boxes_o)
+        if has_vis:
+            vis_boxes_o = xyxy2cxcywh(vis_boxes_o)
 
         image_t = _distort(image)
-        image_t, boxes = _mirror(image_t, boxes)
+        if has_vis:
+            image_t, boxes, vis_boxes = _mirror(image_t, boxes, vis_boxes)
+        else:
+            image_t, boxes = _mirror(image_t, boxes)
         height, width, _ = image_t.shape
         image_t, r_, _ = preproc(image_t, input_dim, self.means, self.std)      # [hgx 0424] _ for raw_image
         # boxes [xyxy] 2 [cx,cy,w,h]
         boxes = xyxy2cxcywh(boxes)
         boxes *= r_
+        if has_vis:
+            vis_boxes = xyxy2cxcywh(vis_boxes)
+            vis_boxes *= r_
 
         mask_b = np.minimum(boxes[:, 2], boxes[:, 3]) > 1
         boxes_t = boxes[mask_b]
         labels_t = labels[mask_b]
         ids_t = ids[mask_b]
+        vis_boxes_t = vis_boxes[mask_b] if has_vis else None
 
         if len(boxes_t) == 0:
             image_t, r_o, _ = preproc(image_o, input_dim, self.means, self.std)     # [hgx 0424] _ for raw_image
@@ -256,12 +288,21 @@ class TrainTransform:
             boxes_t = boxes_o
             labels_t = labels_o
             ids_t = ids_o
+            if has_vis:
+                vis_boxes_o *= r_o
+                vis_boxes_t = vis_boxes_o
 
         labels_t = np.expand_dims(labels_t, 1)
         ids_t = np.expand_dims(ids_t, 1)
 
-        targets_t = np.hstack((labels_t, boxes_t, ids_t))       # get new labels(targets), format: class_id, bbox(xywh), track_id
-        padded_labels = np.zeros((self.max_labels, 6))
+        if has_vis:
+            # format: class_id, bbox(xywh), track_id, vis_bbox(xywh)
+            targets_t = np.hstack((labels_t, boxes_t, ids_t, vis_boxes_t))
+            padded_labels = np.zeros((self.max_labels, 10))
+        else:
+            # get new labels(targets), format: class_id, bbox(xywh), track_id
+            targets_t = np.hstack((labels_t, boxes_t, ids_t))
+            padded_labels = np.zeros((self.max_labels, 6))
         padded_labels[range(len(targets_t))[: self.max_labels]] = targets_t[
             : self.max_labels
         ]

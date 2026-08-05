@@ -31,6 +31,8 @@ def filter_box(output, scale_range):
 
 
 def postprocess(prediction, num_classes, conf_thre=0.7, nms_thre=0.45):
+    # [DB-SORT-VIS] 双头输出为 [full(4), vis(4), obj(1), cls], 按维度自动推断类别起始列
+    cls_start = 9 if prediction.shape[-1] > 5 + num_classes else 5
     box_corner = prediction.new(prediction.shape)
     box_corner[:, :, 0] = prediction[:, :, 0] - prediction[:, :, 2] / 2
     box_corner[:, :, 1] = prediction[:, :, 1] - prediction[:, :, 3] / 2
@@ -46,7 +48,7 @@ def postprocess(prediction, num_classes, conf_thre=0.7, nms_thre=0.45):
             continue
         # Get score and class with highest confidence
         class_conf, class_pred = torch.max(
-            image_pred[:, 5 : 5 + num_classes], 1, keepdim=True
+            image_pred[:, cls_start : cls_start + num_classes], 1, keepdim=True
         )
 
         conf_mask = (image_pred[:, 4] * class_conf.squeeze() >= conf_thre).squeeze()

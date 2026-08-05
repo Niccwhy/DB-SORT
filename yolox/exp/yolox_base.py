@@ -71,7 +71,16 @@ class Exp(BaseExp):
         if getattr(self, "model", None) is None:
             in_channels = [256, 512, 1024]
             backbone = YOLOPAFPN(self.depth, self.width, in_channels=in_channels)
-            head = YOLOXHead(self.num_classes, self.width, in_channels=in_channels)
+            # [DB-SORT-VIS] 从 exp 读取可见框双头配置, 默认关闭
+            head = YOLOXHead(
+                self.num_classes,
+                self.width,
+                in_channels=in_channels,
+                use_visible_head=getattr(self, "use_visible_head", False),
+                vis_loss_weight=getattr(self, "vis_loss_weight", 0.7),
+                vis_assign_weight=getattr(self, "vis_assign_weight", 0.3),
+                vis_warmup_steps=getattr(self, "vis_warmup_steps", 5000),
+            )
             self.model = YOLOX(backbone, head)
 
         self.model.apply(init_yolo)
