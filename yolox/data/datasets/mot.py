@@ -43,13 +43,13 @@ class MOTDataset(Dataset):
         self.class_ids = sorted(self.coco.getCatIds())
         cats = self.coco.loadCats(self.coco.getCatIds())
         self._classes = tuple([c["name"] for c in cats])
+        self.use_visible_head = use_visible_head  # [DB-SORT-VIS]
         self.annotations = self._load_coco_annotations()
         self.name = name
         self.img_size = img_size
         self.preproc = preproc
         self.run_tracking = run_tracking  # [hgx0411] dataloader related
-        self.use_visible_head = use_visible_head  # [DB-SORT-VIS]
-
+       
     def __len__(self):
         return len(self.ids)
 
